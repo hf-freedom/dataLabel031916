@@ -65,7 +65,7 @@ def init_excel():
         wb = Workbook()
         ws = wb.active
         ws.title = "注册购票数据"
-        headers = ["序号", "用户名", "密码", "邮箱", "姓名", "年龄", "手机号", "注册状态", "登录状态", "购票姓名", "身份证号", "购票状态"]
+        headers = ["序号", "用户名", "密码", "邮箱", "姓名", "年龄", "手机号", "注册状态", "登录状态", "购票姓名", "身份证号", "购票状态", "开始抢票时间", "点击抢票按钮次数", "抢票结果"]
         ws.append(headers)
         wb.save(EXCEL_FILE)
         print(f"创建Excel文件: {EXCEL_FILE}")
@@ -279,12 +279,204 @@ def perform_login(page, user_data, task_id, context):
         "login_status": login_status
     }
 
+def get_ticket_button_status(page):
+    """
+    获取抢票按钮的状态
+    返回值: {
+        'status': 'not_released'|'countdown'|'available'|'sold_out',
+        'button': button_element,
+        'text': button_text,
+        'countdown_seconds': 倒计时秒数 (如果是countdown状态)
+    }
+    """
+    # 查找抢票按钮
+    button_selectors = [
+        'button.btn-grab-ticket',
+        'button:has-text("立即抢票")',
+        'button:has-text("未放票")',
+        'button:has-text("已售罄")',
+        'button.ticket-btn',
+        'button[class*="grab"]',
+        'button[class*="ticket"]'
+    ]
+    
+    ticket_btn = None
+    for selector in button_selectors:
+        try:
+            ticket_btn = page.query_selector(selector)
+            if ticket_btn:
+                break
+        except:
+            continue
+    
+    # 如果没找到,尝试查找所有按钮
+    if not ticket_btn:
+        buttons = page.query_selector_all('button')
+        for btn in buttons:
+            btn_text = btn.text_content().strip() if btn.text_content() else ''
+            if any(keyword in btn_text for keyword in ['抢票', '未放票', '已售罄', '倒计时']):
+                ticket_btn = btn
+                break
+    
+    if not ticket_btn:
+        return {'status': 'not_found', 'button': None, 'text': '', 'countdown_seconds': 0}
+    
+    btn_text = ticket_btn.text_content().strip() if ticket_btn.text_content() else ''
+    btn_color = ticket_btn.evaluate('el => window.getComputedStyle(el).backgroundColor') if ticket_btn else ''
+    
+    # 判断按钮状态
+    if '未放票' in btn_text or '即将开售' in btn_text:
+        return {'status': 'not_released', 'button': ticket_btn, 'text': btn_text, 'countdown_seconds': 0}
+    
+    elif '已售罄' in btn_text or '售完' in btn_text:
+        return {'status': 'sold_out', 'button': ticket_btn, 'text': btn_text, 'countdown_seconds': 0}
+    
+    elif '立即抢票' in btn_text or '立即购买' in btn_text or 'btn-grab-ticket' in str(ticket_btn.get_attribute('class')):
+        return {'status': 'available', 'button': ticket_btn, 'text': btn_text, 'countdown_seconds': 0}
+    
+    else:
+        # 尝试解析倒计时
+        # 倒计时格式可能是: "05:32" 或 "5分32秒" 或纯秒数
+        import re
+        countdown_match = re.search(r'(\d+):(\d+)', btn_text)
+        if countdown_match:
+            minutes = int(countdown_match.group(1))
+            seconds = int(countdown_match.group(2))
+            total_seconds = minutes * 60 + seconds
+            return {'status': 'countdown', 'button': ticket_btn, 'text': btn_text, 'countdown_seconds': total_seconds}
+        
+        # 尝试匹配 "X分Y秒" 格式
+        countdown_match2 = re.search(r'(\d+)\s*分\s*(\d+)\s*秒', btn_text)
+        if countdown_match2:
+            minutes = int(countdown_match2.group(1))
+            seconds = int(countdown_match2.group(2))
+            total_seconds = minutes * 60 + seconds
+            return {'status': 'countdown', 'button': ticket_btn, 'text': btn_text, 'countdown_seconds': total_seconds}
+        
+        # 如果是数字(纯秒数)
+        if btn_text.isdigit():
+            return {'status': 'countdown', 'button': ticket_btn, 'text': btn_text, 'countdown_seconds': int(btn_text)}
+    
+    # 默认返回可用状态
+    return {'status': 'available', 'button': ticket_btn, 'text': btn_text, 'countdown_seconds': 0}
+
+
+def wait_and_click_countdown(page, btn_info, task_id, start_time_before=10):
+    """
+    等待倒计时,在倒计时结束前start_time_before秒开始点击
+    每秒点击1次
+    返回: (click_count, success)
+    """
+    countdown_seconds = btn_info['countdown_seconds']
+    button = btn_info['button']
+    
+    print(f"[任务{task_id}] 检测到倒计时: {countdown_seconds}秒")
+    
+    # 计算需要等待的时间
+    wait_time = max(0, countdown_seconds - start_time_before)
+    
+    if wait_time > 0:
+        print(f"[任务{task_id}] 等待 {wait_time} 秒后开始抢票...")
+        time.sleep(wait_time)
+    
+    # 开始抢票,每秒点击1次
+    click_count = 0
+    start_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    
+    print(f"[任务{task_id}] 开始抢票点击 (提前{start_time_before}秒), 每秒1次...")
+    
+    # 持续点击直到成功或倒计时结束后再点几次
+    max_attempts = start_time_before + 5  # 多尝试5秒
+    
+    for attempt in range(max_attempts):
+        try:
+            # 重新获取按钮状态
+            current_status = get_ticket_button_status(page)
+            
+            if current_status['status'] == 'available':
+                # 按钮变为可点击状态
+                print(f"[任务{task_id}] 按钮变为可点击状态,立即点击!")
+                current_status['button'].click()
+                click_count += 1
+                page.wait_for_load_state("networkidle")
+                page.wait_for_timeout(1000)
+                return click_count, True, start_time
+            
+            elif current_status['status'] == 'sold_out':
+                print(f"[任务{task_id}] 票已售罄!")
+                return click_count, False, start_time
+            
+            elif current_status['status'] == 'countdown' and current_status['button']:
+                # 继续点击
+                current_status['button'].click()
+                click_count += 1
+                print(f"[任务{task_id}] 第 {click_count} 次点击抢票按钮")
+                time.sleep(1)
+            
+            elif current_status['status'] == 'not_found':
+                # 页面可能已跳转
+                print(f"[任务{task_id}] 按钮状态变化,可能已跳转")
+                return click_count, True, start_time
+            
+            else:
+                # 其他情况也尝试点击
+                if current_status['button']:
+                    current_status['button'].click()
+                    click_count += 1
+                    print(f"[任务{task_id}] 第 {click_count} 次点击抢票按钮")
+                time.sleep(1)
+                
+        except Exception as e:
+            print(f"[任务{task_id}] 点击时出错: {e}")
+            # 可能是页面已跳转,视为成功
+            return click_count, True, start_time
+    
+    return click_count, False, start_time
+
+
+def check_ticket_release(page, task_id, check_interval=180):
+    """
+    检查是否放票,每check_interval秒检查一次
+    返回: button_info 当按钮状态变为非未放票时
+    """
+    print(f"[任务{task_id}] 票未放出,开始轮询检查 (每{check_interval}秒检查一次)...")
+    
+    check_count = 0
+    while True:
+        check_count += 1
+        print(f"[任务{task_id}] 第 {check_count} 次检查票状态...")
+        
+        btn_info = get_ticket_button_status(page)
+        
+        if btn_info['status'] != 'not_released':
+            print(f"[任务{task_id}] 票状态变化: {btn_info['status']}")
+            return btn_info
+        
+        print(f"[任务{task_id}] 仍未放票, {check_interval}秒后再次检查...")
+        time.sleep(check_interval)
+        
+        # 刷新页面获取最新状态
+        try:
+            page.reload()
+            page.wait_for_load_state("networkidle")
+            page.wait_for_timeout(2000)
+        except Exception as e:
+            print(f"[任务{task_id}] 刷新页面出错: {e}")
+
+
 def perform_ticket_purchase(page, context, task_id):
+    """
+    新的抢票流程
+    1. 判断抢票按钮状态
+    2. 根据状态执行不同策略
+    3. 记录抢票数据
+    """
     print(f"[任务{task_id}] 开始抢票流程...")
     
+    # 首先进入抢票页面
     ticket_btn = page.query_selector('button.btn-grab-ticket') or page.query_selector('button:has-text("立即抢票")')
     if ticket_btn:
-        print(f"[任务{task_id}] 点击立即抢票按钮...")
+        print(f"[任务{task_id}] 点击立即抢票按钮进入抢票页面...")
         ticket_btn.click()
         page.wait_for_load_state("networkidle")
         page.wait_for_timeout(3000)
@@ -298,6 +490,7 @@ def perform_ticket_purchase(page, context, task_id):
                 page.wait_for_timeout(3000)
                 break
     
+    # 获取抢票页面
     ticket_page = None
     for p in context.pages:
         if '8085' in p.url or 'ticket' in p.url.lower():
@@ -309,19 +502,74 @@ def perform_ticket_purchase(page, context, task_id):
     
     if not ticket_page:
         print(f"[任务{task_id}] 未找到抢票页面")
-        return {"ticket_name": "", "ticket_id": "", "purchase_status": "失败-未找到抢票页面"}
+        return {
+            "ticket_name": "", 
+            "ticket_id": "", 
+            "purchase_status": "失败-未找到抢票页面",
+            "start_time": "",
+            "click_count": 0,
+            "result": "失败"
+        }
     
     ticket_page.wait_for_load_state("networkidle")
     ticket_page.wait_for_timeout(2000)
     print(f"[任务{task_id}] 抢票页面URL: {ticket_page.url}")
     
-    ticket_btn2 = ticket_page.query_selector('button.ticket-btn') or ticket_page.query_selector('button:has-text("立即抢票")')
-    if ticket_btn2:
-        print(f"[任务{task_id}] 点击抢票页面的立即抢票...")
-        ticket_btn2.click()
-        ticket_page.wait_for_load_state("networkidle")
-        ticket_page.wait_for_timeout(3000)
+    # 初始化抢票记录数据
+    start_time = ""
+    click_count = 0
+    result = "失败"
     
+    # 判断抢票按钮状态并执行相应策略
+    btn_info = get_ticket_button_status(ticket_page)
+    print(f"[任务{task_id}] 抢票按钮状态: {btn_info['status']}, 文字: {btn_info['text']}")
+    
+    if btn_info['status'] == 'not_released':
+        # 未放票状态,每3分钟检查一次
+        btn_info = check_ticket_release(ticket_page, task_id, check_interval=180)
+        # 检查后继续判断新状态
+    
+    if btn_info['status'] == 'sold_out':
+        # 已售罄
+        print(f"[任务{task_id}] 票已售罄,抢票失败!")
+        result = "失败-已售罄"
+        return {
+            "ticket_name": "",
+            "ticket_id": "",
+            "purchase_status": "失败-已售罄",
+            "start_time": "",
+            "click_count": 0,
+            "result": "失败-已售罄"
+        }
+    
+    if btn_info['status'] == 'countdown':
+        # 倒计时状态,提前10秒开始点击,每秒1次
+        click_count, success, start_time = wait_and_click_countdown(ticket_page, btn_info, task_id, start_time_before=10)
+        if not success:
+            return {
+                "ticket_name": "",
+                "ticket_id": "",
+                "purchase_status": "失败-倒计时抢票未成功",
+                "start_time": start_time,
+                "click_count": click_count,
+                "result": "失败"
+            }
+        # 成功后继续填写信息
+    
+    elif btn_info['status'] == 'available':
+        # 立即抢票状态
+        start_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        print(f"[任务{task_id}] 立即抢票,开始时间: {start_time}")
+        
+        try:
+            btn_info['button'].click()
+            click_count = 1
+            ticket_page.wait_for_load_state("networkidle")
+            ticket_page.wait_for_timeout(3000)
+        except Exception as e:
+            print(f"[任务{task_id}] 点击抢票按钮出错: {e}")
+    
+    # 填写购票信息
     print(f"[任务{task_id}] 购票页面URL: {ticket_page.url}")
     
     inputs = ticket_page.query_selector_all('input')
@@ -358,15 +606,21 @@ def perform_ticket_purchase(page, context, task_id):
             ticket_page.wait_for_load_state("networkidle")
             ticket_page.wait_for_timeout(2000)
             purchase_status = "成功"
+            result = "成功"
         else:
             purchase_status = "失败-未找到提交按钮"
+            result = "失败"
     else:
         purchase_status = "失败-未找到输入框"
+        result = "失败"
     
     return {
         "ticket_name": ticket_name,
         "ticket_id": ticket_id,
-        "purchase_status": purchase_status
+        "purchase_status": purchase_status,
+        "start_time": start_time,
+        "click_count": click_count,
+        "result": result
     }
 
 def single_task(task_id, user_data):
@@ -402,13 +656,16 @@ def single_task(task_id, user_data):
             ticket_result = {
                 "ticket_name": "",
                 "ticket_id": "",
-                "purchase_status": "未购票"
+                "purchase_status": "未购票",
+                "start_time": "",
+                "click_count": 0,
+                "result": "未尝试"
             }
-            
+
             if login_result['login_status'] == "成功":
                 ticket_result = perform_ticket_purchase(page, context, task_id)
                 print(f"[任务{task_id}] 购票状态: {ticket_result['purchase_status']}")
-            
+
             excel_data = [
                 task_id,
                 user_data["username"],
@@ -421,9 +678,12 @@ def single_task(task_id, user_data):
                 login_result["login_status"],
                 ticket_result["ticket_name"],
                 ticket_result["ticket_id"],
-                ticket_result["purchase_status"]
+                ticket_result["purchase_status"],
+                ticket_result.get("start_time", ""),
+                ticket_result.get("click_count", 0),
+                ticket_result.get("result", "")
             ]
-            
+
             save_to_excel(excel_data)
             
             print(f"\n[任务{task_id}] ========== 执行完成 ==========")
